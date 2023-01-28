@@ -1,3 +1,6 @@
+#=========================================#
+#     CHRIS Metabolites data analysis
+#=========================================#
 
 #Download required packages
 install.packages("BiocManager")
@@ -81,8 +84,13 @@ colData(biochristes7500)
 concentrations(biochristes7500)[1:4, 1:3]
 concentrations(biochristes7500, blessing = "none")[1:4, 1:3]
 
-# Box plot
+# Retrieve name of the metabolites
 rowData(biochristes7500)["C14", ]
+rowData(biochristes7500) %>%
+  as.data.frame() %>% 
+  filter(analyte_name == "alpha-AAA") %>% View
+
+# Box plot
 boxplot(split(log2(c14), biochristes7500$plate_name), main = "C14",
         ylab = expression(log[2]~signal), las = 2)
 
@@ -95,12 +103,13 @@ plot(hist(log2(pts), breaks = 128), xlab = expression(log[2]~signal),
 chrisMass <- 
   concentrations(biochristes7500,
                  blessing = "none") %>%
-  as_tibble() %>%
-  mutate(Metabolite = row.names(concentrations(biochristes7500))) %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "Metabolite") %>%
   pivot_longer(cols = -Metabolite,
                names_to = "AID") %>% 
   pivot_wider(names_from = Metabolite) %>%
-  mutate(across(!AID, function(x) log(x))) %>% 
+  #Caution: log transformation widely affects the results in step 3 -> no mediator after log trans
+  #mutate(across(!AID, function(x) log(x))) %>% 
   janitor::clean_names() %>% #janitor::row_to_names(1)
   rename(AID = aid)
 
@@ -118,11 +127,102 @@ vcfMass <-
   inner_join(chrisMass, by = "AID") %>% #dim()
   inner_join(vcfmod,    by = "AID") #%>% dim()
   
+
+#-----------------------------------------------------#
+#-------------- Step 2: trait as covariate -----------
+#-----------------------------------------------------#
+
+step2_to_table <- 
+  function(mytrait,
+           mytarget,
+           data){
+    results1 <- lapply(mytrait,
+                       function(Trait){
+                         map_df(mytarget,
+                                function(SNP){
+                                  myformula <- as.formula(
+    eGFRw.log.Res ~ SNP + Trait + Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10)
+                                  m <- lm(myformula, data = data)
+                                  s <- coef(m)[2]
+                                  p <- summary(m)$coefficients[2, c(1,2,4)] #Beta, se, Pvalue
+                                  #t <- tidy(m)[2, c(1,2,4)]#broom
+                                  return(p)
+                                })
+                       })
+    results2 <- as.data.frame(do.call(cbind, results1)) #%>% clean_names() #library(janitor)
+    names(results2) <- str_replace_all(names(results2),
+                                       c("Estimate"   = "Estimate",
+                                         "Std. Error" = "SE",
+                                         "Pr\\([^\\(]*\\)" = "Pvalue"))
+    nloc <- length(mytarget)
+    results3 <- cbind(SNPid = names(mytarget),
+                      Locus = repSNPs$Locus[1:nloc],
+                      results2)
+    return(results3)
+  }
+
+#---------#
+MMA_Step2_raw <-
+  step2_to_table(vcfMass[metabolites],
+                 vcfMass[targets],
+                 vcfMass)
+#---------#
+#Turning the results to longer format for merging with step3
+MMA_results_Step2_long <- 
+  MMA_Step2_raw %>% 
+  pivot_longer(cols = -c(SNPid, Locus),
+               names_to = c("Trait", "value"),
+               names_pattern = "(.+).(Estimate|SE|Pvalue)$",
+               values_to = c("score")) %>%
+  pivot_wider(names_from = "value",
+              values_from = "score") %>% 
+  group_by(SNPid) %>%
+  mutate(outlier = ifelse(is_outlier(Estimate),
+                          "Yes",
+                          "No")) %>% 
+  ungroup()
+#---------#
+write.csv(MMA_results_Step2_long,
+          "29-Nov-2022_MMD_Step2_SNPs adjusted for metabolites_long format.csv",
+          row.names = F,
+          quote = F)
+
+#---------#
+#Heatmap for step 2
+
+library(pheatmap)
+png("28-Nov-2022_Heatmap_MMD_Step2_SNPs adjusted for metabolites.png", 
+    units="in", res = 300, width=10, height=12)
+#pdf('pheatmap2.pdf', width=18, height = 18)
+
+
+MMA_results_Step2_long_HM <-
+  repSNPs %>%                    
+  select(SNPid, Locus, Beta_CHRIS) %>% 
+  inner_join(MMA_Step2_raw,
+             by = c("SNPid", "Locus")) %>%
+  #filter(SNPid %in% leadingSNPs) %>%
+  select(SNPid, Locus, Beta_CHRIS, contains("Estimate")) %>%
+  mutate(across(contains("Estimate"), function(x) x / Beta_CHRIS))
+
+pheatmap(MMA_results_Step2_long_HM[,-c(1:3)],
+         cluster_cols = F,
+         cluster_rows = F, 
+         show_rownames = T, 
+         labels_row = MMA_Step2_raw$SNPid, 
+         border_color = NA, 
+         fontsize = 4, 
+         angle_col = "45")
+
+dev.off()
+
 #-----------------------------------------------------#
 #--------------- Step 3: metabolite as outcome -------
 #-----------------------------------------------------#
 
 #Mediation Analysis -> Step 3: Metabolites as the outcome
+
+summary(lm(alpha_aaa ~ `chr1:10599281` + Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10 , data = vcfMass))
 
 #function for iterating retrieving 
 #the regression coefficients
@@ -132,11 +232,13 @@ step3_to_table <-
            mytarget, 
            myformula,
            data){
-    res3 <- map2_dfr(
+    Trait <- names(mytrait)
+    SNPid <- names(mytarget)
+    res3  <- map2_df(
       .x = mytrait,
       .y = myformula,
       .f = function(trait, formula){
-        res1 <- map_dfr(
+        res1 <- map_df(
           .x = mytarget,
           .f = function(SNP)
           {
@@ -145,54 +247,64 @@ step3_to_table <-
             return(p)
           }
         )
-        res2 <- as.data.frame(res1)
-        colnames(res2) <- c("Estimate",
+
+        colnames(res1) <- c("Estimate",
                             "SE",
                             "Pvalue")
-        Nsnp       <- length(mytarget)
-        res2$SNPid <- rep(colnames(mytarget)[1:Nsnp], 1)
+        res2 <-
+          cbind(SNPid,
+                res1) %>%
+          merge(
+            repSNPs[c("Locus", "SNPid")],
+            .,
+            by = "SNPid",
+            all = F)
+        
         return(res2)
       }
     )
-    res3$pheno <- rep(colnames(mytrait), each = length(unique(res3$SNPid)))
-    res4 <- 
-      res3 %>%
-      pivot_wider(id_cols     = SNPid,
-                  names_from  = pheno,
-                  values_from = c(Estimate, SE , Pvalue),
-                  names_glue  = "{pheno}_{.value}")
-    return(res3)
+    
+    res3$pheno <- rep(colnames(mytrait),
+                      each = length(unique(res3$SNPid)))
+    res4 <- res3 %>%
+    pivot_wider(id_cols     = c(Locus, SNPid),
+                names_from  = pheno,
+                values_from = c(Estimate, SE , Pvalue),
+                names_glue  = "{pheno}_{.value}")
+    return(res4)
   }
 #---------#
 
-MMA_Step3_raw <-
+MMA_Step3_raw <- 
   step3_to_table(vcfMass[metabolites],
                  vcfMass[targets],
                  paste("trait ~ SNP + Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10"),
-                 vcfMass)
+                 vcfMass) #%>% #change the order of the columns
+  # select(contains(c("Locus",
+  #                   "SNPid",
+  #                   "pheno",
+  #                   "Estimate",
+  #                   "SE",
+  #                   "Pvalue")))
 
-#Appending Locus column to the results
-results_Step3_long <-
-  repSNPs %>%                    
-  select(SNPid, Locus) %>% 
-  inner_join(MMA_Step3_raw,
-             by = c("SNPid")) %>% 
-  #change the order of the columns
-  select(contains(c("SNPid",
-                    "Locus",
-                    "pheno",
-                    "Estimate",
-                    "SE",
-                    "Pvalue"))) %>%
+# Reconstruct to longer format
+MMA_results_Step3_long <-
+  MMA_Step3_raw %>%
+  pivot_longer(cols = -c(SNPid, Locus),
+               names_to = c("Trait", "value"),
+               names_pattern = "(.+)_(Estimate|SE|Pvalue)$",
+               values_to = c("score")) %>%
+  pivot_wider(names_from = "value",
+              values_from = "score") %>%
   #Significant association between variants and metabolites
-  mutate(related = ifelse(Pvalue <= 0.05/1750,
-                          "Yes",
-                          "No")) #%>% filter(related == "Yes") %>% View
+  mutate(associated = ifelse(Pvalue <= 0.05/1925,
+                             "Yes",
+                             "No")) #%>% filter(associated == "Yes") %>% View
 
-write.csv(results_Step3_long, "29-Nov-2022_MMD_Step3_SNPs associated with metabolites.csv", row.names = F, quote = F)
+write.csv(MMA_results_Step3_long, "29-Nov-2022_MMD_Step3_SNPs associated with metabolites.csv", row.names = F, quote = F)
 
 #heatmap of step 3
-results_Step3_long %>%
+MMA_results_Step3_long %>%
   mutate(SNP = factor(SNPid,
                       levels = str_sort(unique(SNPid),
                                         numeric = TRUE,
@@ -229,128 +341,53 @@ pheatmap(results_Step3_long$Estimate,
 
 dev.off()
 
+#-----------------------------------------------------#
+#-------------------- Merge 3 Steps ------------------
+#-----------------------------------------------------#
 
-#----------------- Step 2: trait as covariate -----------------
-
-step2_to_table <- 
-  function(mytrait,
-           mytarget,
-           data){
-    results1 <- lapply(mytrait,
-                       function(trait){
-                         map_df(mytarget,
-                                function(SNP){
-                                  myformula <- as.formula(
-    eGFRw.log.Res ~ SNP + trait + Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10)
-                                  m <- lm(myformula, data = data)
-                                  s <- coef(m)[2]
-                                  p <- summary(m)$coefficients[2, c(1,2,4)] #Beta, se, Pvalue
-                                  #t <- tidy(m)[2, c(1,2,4)]#broom
-                                  return(p)
-                                })
-                       })
-    results2 <- as.data.frame(do.call(cbind, results1)) #%>% clean_names() #library(janitor)
-    names(results2) <- str_replace_all(names(results2),
-                                       c("Estimate"   = "Estimate",
-                                         "Std. Error" = "SE",
-                                         "Pr\\([^\\(]*\\)" = "Pvalue"))
-    #colnames(results2) <- names(mytrait)
-    nloc <- length(mytarget)
-    results3 <- cbind(SNPid = names(mytarget),
-                      Locus = repSNPs$Locus[1:nloc],
-                      results2)
-    return(results3)
-  }
-
-MMA_Step2_raw <-
-  step2_to_table(vcfMass[metabolites],
-                 vcfMass[targets],
-                 vcfMass)
-
-#Turning the results to longer format for merging with step3
-results_Step2_long <- 
-  MMA_Step2_raw %>% 
-  pivot_longer(cols = -c(SNPid, Locus),
-               names_to = c("trait", "value"),
-               names_pattern = "(.+).(Estimate|SE|Pvalue)$",
-               values_to = c("score")) %>%
-  pivot_wider(names_from = "value",
-              values_from = "score") %>% 
-  group_by(Locus, SNPid) %>%
-  mutate(outlier = ifelse(is_outlier(Estimate),
-                          "Yes",
-                          "No")) %>% 
-  ungroup()
-
-write.csv(results_Step2_long,
-          "29-Nov-2022_MMD_Step2_SNPs adjusted for metabolites_long format.csv",
-          row.names = F,
-          quote = F)
-
-#---------#
-#Heatmap for step 2
-
-library(pheatmap)
-png("28-Nov-2022_Heatmap_MMD_Step2_SNPs adjusted for metabolites.png", 
-    units="in", res = 300, width=10, height=12)
-#pdf('pheatmap2.pdf', width=18, height = 18)
-
-
-results_Step2_long <-
-  repSNPs %>%                    
-  select(SNPid, Locus, BETA) %>% 
-  inner_join(MMA_Step2_raw,
-             by = "SNPid") %>% 
-  #filter(SNPid %in% leadingSNPs) %>%
-  select(SNPid, Locus, BETA, contains("Estimate")) %>%
-  mutate(across(contains("Estimate"), function(x) x / BETA))
-
-pheatmap(results_Step2_long[,-c(1:3)],
-         cluster_cols = F,
-         cluster_rows = F, 
-         show_rownames = T, 
-         labels_row = MMA_Step2_raw$SNPid, 
-         border_color = NA, 
-         fontsize = 4, 
-         angle_col = "45")
-
-dev.off()
-
-#----------------- Merge 3 Steps -----------------
-
-results_Step2_long %>%
-  inner_join(results_Step3_long,
-             by = c("SNPid" = "SNPid",
-                    "Locus" = "Locus",
-                    "trait" = "pheno"),
-             suffix = c("_Step2", "_Step3")) %>%
-  inner_join(repSNPs[c("SNPid",
-                       "Locus",
-                       "MARKER_ID",
-                       "BETA",
-                       "SEBETA",
-                       "PVALUE")],
-             by = c("SNPid", "Locus")) %>%
+MMA_results_Step2_long %>%
+  inner_join(
+    MMA_results_Step3_long,
+    by = c("SNPid" = "SNPid",
+           "Locus" = "Locus",
+           "Trait" = "Trait"),
+    suffix = c("_Step2",
+               "_Step3")) %>%
+  inner_join(
+    repSNPs[c("SNPid",
+              "Locus",
+              "RA_CHRIS_disc",
+              "EA_CHRIS_disc",
+              "Beta_CHRIS",
+              "SE_CHRIS",
+              "Pvalue_CHRIS")],
+    by = c("SNPid",
+           "Locus")) %>%
   mutate(
-    REF = str_split(MARKER_ID, "\\W", simplify = TRUE)[,5],
-    ALT = str_split(MARKER_ID, "\\W", simplify = TRUE)[,6],
+    EA_OA = paste0(EA_CHRIS_disc, "/", RA_CHRIS_disc),
     outlierRelated = case_when(
-    outlier == "Yes" & related == "Yes" ~ "Yes/Yes",
-    outlier == "Yes" & related != "Yes" ~ "Yes/No",
-    outlier != "Yes" & related == "Yes" ~ "No/Yes",
-    outlier != "Yes" & related != "Yes" ~ "No/No"),
-    mediator = ifelse(outlier == "Yes" & related == "Yes", "Yes", "No"),
+    outlier == "Yes" & associated == "Yes" ~ "Yes/Yes",
+    outlier == "Yes" & associated != "Yes" ~ "Yes/No",
+    outlier != "Yes" & associated == "Yes" ~ "No/Yes",
+    outlier != "Yes" & associated != "Yes" ~ "No/No"),
+    mediator = ifelse(outlier == "Yes" & associated == "Yes", "Yes", "No"),
     SNP = factor(SNPid,
                  levels = str_sort(unique(SNPid),
                                    numeric = TRUE,
                                    decreasing = TRUE))) %>%
-  rename(Estimate_GWAS = BETA, 
-         SE_GWAS       = SEBETA, 
-         Pvalue_GWAS   = PVALUE) %>%
-  select(SNPid, Locus, REF, ALT, 
-         Estimate_GWAS, SE_GWAS, Pvalue_GWAS, everything()) %>% #View()
-  #filter(mediator == "Yes") %>% 
-  write.csv(., "29-Nov-22_Heatmap_MMD_Step 1&2&3_outlierRelated traits.csv", row.names = FALSE)
+  rename(
+    Estimate_GWAS = Beta_CHRIS,
+    SE_GWAS       = SE_CHRIS,
+    Pvalue_GWAS   = Pvalue_CHRIS) %>%
+  select(
+    Locus, SNPid, EA_OA,
+    Estimate_GWAS, SE_GWAS, Pvalue_GWAS, everything()) %>%
+  filter(
+    #Trait == "alpha_aaa",
+    #Locus == "CASZ1",
+    Pvalue_Step3 < 0.05/11/175 ) %>% View
+  #count(Locus, associated)
+  #write.csv(., "29-Nov-22_Heatmap_MMD_Step 1&2&3_outlierRelated traits_Mediatory metabolites.csv", row.names = FALSE)
   ggplot(aes(x = trait, y = SNP, fill = outlierRelated)) +
     geom_tile() +
     theme_classic() +
@@ -367,7 +404,6 @@ results_Step2_long %>%
 ggsave("29-Nov-22_Heatmap_MMD_Step 1&2&3_outlierRelated traits.png", 
        last_plot(), width = 10, height = 9, pointsize = 4, dpi = 300, units = "in")
 
- 
 
 
 
