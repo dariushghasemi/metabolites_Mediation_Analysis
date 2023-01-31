@@ -100,7 +100,7 @@ plot(hist(log2(pts), breaks = 128), xlab = expression(log[2]~signal),
 #-----------------------------------------------------#
 
 #preparing metabolites data for jointing with genotypes
-chrisMass <- 
+chrisMass_nolog <- 
   concentrations(biochristes7500,
                  blessing = "none") %>%
   as.data.frame() %>% 
@@ -121,10 +121,10 @@ metabolites <- chrisMass %>% select(-AID) %>% colnames() #%>% View
 #-----------------------------------------------------#
 
 #Merge metabolites7500 with CHRIS baseline
-vcfMass <-
+vcfMass_nolog <-
   chris[c("AID", "Age", "Sex", "eGFRw.log.Res")] %>%
   inner_join(PCs_13K,   by = "AID") %>% #dim()
-  inner_join(chrisMass, by = "AID") %>% #dim()
+  inner_join(chrisMass_nolog, by = "AID") %>% #dim()
   inner_join(vcfmod,    by = "AID") #%>% dim()
   
 
@@ -195,7 +195,7 @@ png("28-Nov-2022_Heatmap_MMD_Step2_SNPs adjusted for metabolites.png",
     units="in", res = 300, width=10, height=12)
 #pdf('pheatmap2.pdf', width=18, height = 18)
 
-
+# for HeatMap
 MMA_results_Step2_long_HM <-
   repSNPs %>%                    
   select(SNPid, Locus, Beta_CHRIS) %>% 
@@ -255,10 +255,10 @@ step3_to_table <-
           cbind(SNPid,
                 res1) %>%
           merge(
-            repSNPs[c("Locus", "SNPid")],
+            repSNPs[c("SNPid", "Locus")],
             .,
             by = "SNPid",
-            all = F)
+            all = F, sort = F)
         
         return(res2)
       }
@@ -266,27 +266,28 @@ step3_to_table <-
     
     res3$pheno <- rep(colnames(mytrait),
                       each = length(unique(res3$SNPid)))
-    res4 <- res3 %>%
-    pivot_wider(id_cols     = c(Locus, SNPid),
-                names_from  = pheno,
-                values_from = c(Estimate, SE , Pvalue),
-                names_glue  = "{pheno}_{.value}")
+    res4 <- 
+      res3 %>%
+      pivot_wider(id_cols     = c(Locus, SNPid),
+                  names_from  = pheno,
+                  values_from = c(Estimate, SE , Pvalue),
+                  names_glue  = "{pheno}_{.value}")
     return(res4)
   }
+
 #---------#
-
 MMA_Step3_raw <- 
-  step3_to_table(vcfMass[metabolites],
-                 vcfMass[targets],
-                 paste("trait ~ SNP + Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10"),
-                 vcfMass) #%>% #change the order of the columns
-  # select(contains(c("Locus",
-  #                   "SNPid",
-  #                   "pheno",
-  #                   "Estimate",
-  #                   "SE",
-  #                   "Pvalue")))
+  step3_to_table(
+    vcfMass[metabolites],
+    vcfMass[targets],
+    paste("trait ~ SNP + Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10"),
+    vcfMass) %>% #change the order of the columns
+  select(
+    contains(c("Locus",
+               "SNPid",
+               metabolites))) #%>% View
 
+#---------#
 # Reconstruct to longer format
 MMA_results_Step3_long <-
   MMA_Step3_raw %>%
@@ -301,9 +302,30 @@ MMA_results_Step3_long <-
                              "Yes",
                              "No")) #%>% filter(associated == "Yes") %>% View
 
-write.csv(MMA_results_Step3_long, "29-Nov-2022_MMD_Step3_SNPs associated with metabolites.csv", row.names = F, quote = F)
+#---------#
+write.csv(MMA_results_Step3_long,
+          "29-Nov-2022_MMD_Step3_SNPs associated with metabolites.csv",
+          row.names = F, quote = F)
+#---------#
+# results of no-log-transformed metabolites
+MMA_results_Step3_long_nolog <-
+  step3_to_table(
+  vcfMass_nolog[metabolites],
+  vcfMass_nolog[targets],
+  paste("trait ~ SNP + Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10"),
+  vcfMass_nolog) %>%
+  pivot_longer(cols          = -c(SNPid, Locus),
+               names_to      = c("Trait", "value"),
+               names_pattern = "(.+)_(Estimate|SE|Pvalue)$",
+               values_to     = c("score")) %>%
+  pivot_wider(names_from     = "value",
+              values_from    = "score") %>%
+  mutate(associated = ifelse(Pvalue <= 0.05/1925,
+                             "Yes",
+                             "No"))
 
-#heatmap of step 3
+#---------#
+# Heatmap of step 3
 MMA_results_Step3_long %>%
   mutate(SNP = factor(SNPid,
                       levels = str_sort(unique(SNPid),
@@ -326,6 +348,7 @@ MMA_results_Step3_long %>%
 ggsave("29-Nov-22_MMD_Step3_SNPs associated with metabolites_Pvalue.png", 
        last_plot(), width = 16, height = 12, pointsize = 4, dpi = 300, units = "in")
 
+#---------#
 #pretty heatmap
 pdf('24-Nov-22_Heatmap of MMD_Step3_SNPs associated with metabolites.pdf', width=8, height = 6)
 library(pheatmap)
@@ -345,7 +368,8 @@ dev.off()
 #-------------------- Merge 3 Steps ------------------
 #-----------------------------------------------------#
 
-MMA_results_Step2_long %>%
+MMA_sum3steps_long <-
+  MMA_results_Step2_long %>%
   inner_join(
     MMA_results_Step3_long,
     by = c("SNPid" = "SNPid",
@@ -381,11 +405,12 @@ MMA_results_Step2_long %>%
     Pvalue_GWAS   = Pvalue_CHRIS) %>%
   select(
     Locus, SNPid, EA_OA,
-    Estimate_GWAS, SE_GWAS, Pvalue_GWAS, everything()) %>%
+    Estimate_GWAS, SE_GWAS, Pvalue_GWAS, everything()) #%>%
   filter(
     #Trait == "alpha_aaa",
     #Locus == "CASZ1",
-    Pvalue_Step3 < 0.05/11/175 ) %>% View
+    #Pvalue_Step3 < 0.05/11/175,
+    mediator == "Yes") %>% View
   #count(Locus, associated)
   #write.csv(., "29-Nov-22_Heatmap_MMD_Step 1&2&3_outlierRelated traits_Mediatory metabolites.csv", row.names = FALSE)
   ggplot(aes(x = trait, y = SNP, fill = outlierRelated)) +
@@ -394,9 +419,9 @@ MMA_results_Step2_long %>%
   scale_fill_manual(values=c('white', "grey50", "#FF6666"))+ #'#999999', "#E69F00"
   labs(x    = "",
        y    = "")+
-  theme(legend.title= element_text(size=7, face="bold"),
+  theme(legend.title = element_text(size=7, face="bold"),
         legend.key.size = unit(0.4, 'cm'),
-        legend.text  = element_text(size = 8),
+        legend.text = element_text(size = 8),
         axis.text.x = element_text(size=4, face="bold", angle=90, vjust=1.05, hjust=1),
         axis.text.y = element_text(size=4, face="bold"),
         axis.title  = element_text(size=12,face="bold"))
@@ -404,6 +429,68 @@ MMA_results_Step2_long %>%
 ggsave("29-Nov-22_Heatmap_MMD_Step 1&2&3_outlierRelated traits.png", 
        last_plot(), width = 10, height = 9, pointsize = 4, dpi = 300, units = "in")
 
+#---------#
+# compare step 3 results for log-transformed vs non-transformed metabolites 
+MMA_results_Step3_long_nolog %>%
+  inner_join(MMA_results_Step3_long,
+             by = c("Locus", "SNPid", "Trait"),
+             suffix = c("_nonTrans", "_logTrans")) %>%
+  filter(Trait == "alpha_aaa") %>% 
+  ggplot(aes(x = Estimate_nonTrans,
+             # xmin =  Estimate_nonTrans - SE_nonTrans,
+             # xmax =  Estimate_nonTrans + SE_nonTrans,
+             y = Estimate_logTrans,
+             # ymin =  Estimate_logTrans - SE_logTrans,
+             # ymax =  Estimate_logTrans + SE_logTrans,
+             color = Locus, shape = Locus))+
+  geom_abline(slope = 1) +
+  geom_vline(xintercept = 0) +
+  geom_hline(yintercept = 0) +
+  geom_point(alpha = 0.9, size = 2.5, fatten = 2.2) +
+  scale_shape_manual(values = c(19, 17, 18, 17, 19, 15, 17, 19, 17, 19, 15)) +
+  scale_color_manual(values = c(
+    "maroon1", "darkorchid2","orange2", "green4", "steelblue2", "darkturquoise", "tomato",
+    "springgreen2", "royalblue2", "gold", "grey50")) +
+  labs(x = "SNPs effect on ln(eGFRcreat) adj for metabolite Alpha_AAA",
+       y = "SNPs effect on ln(eGFRcreat) adj for metabolite ln(Alpha_AAA)")+
+  theme(panel.background = element_rect(fill = "white"),
+        strip.background = element_blank(),
+        strip.text.x = element_text(size = 12, face = "bold"),
+        strip.placement = "outside",
+        axis.text.x = element_text(size=8, face="bold"),
+        axis.text.y = element_text(size=8, face="bold"),
+        axis.title = element_text(size=12, face="bold"),
+        legend.key.size  = unit(0.99, 'cm'),
+        legend.key.width = unit(0.7, 'cm'),
+        legend.text  = element_text(size = 12),
+        legend.title = element_text(size = 14, face = "bold"))
 
+ggsave("29-Jan-23_SNPs effect adj for Alpha_AAA metabolite with_out log transformation.png",
+       last_plot(), width = 10, height = 7, pointsize = 4, dpi = 300, units = "in")
+
+
+#---------#
+# Checking the distribution
+vcfMass %>%
+  select(AID, eGFRw.log.Res, alpha_aaa, starts_with("chr1:")) %>%
+  mutate(alpha_aaa_log = log(2 + alpha_aaa)) %>%
+    # Dosage_SLC34A1 = cut(`chr5:177386403`,
+    #                           breaks = c(-Inf, 0.500, 1.500, Inf),
+    #                           labels = c("0", "1", "2"))) %>%
+  pivot_longer(cols = c(alpha_aaa, alpha_aaa_log),
+               names_to  = "metabolite",
+               values_to = "value") %>%
+  #ggplot(aes(Dosage_SLC34A1, eGFRw.log.Res))+
+  #geom_violin(aes(fill = Peptited), position = "dodge")+
+  #geom_boxplot(aes(fill = Peptited), width = 0.3, position = position_dodge(.9))+
+  ggplot(aes(x = value)) +
+  geom_density(aes(fill = metabolite), alpha = 0.6, color = "grey50") + #, show.legend = NULL
+  #scale_fill_manual(values = c("violetred1", "turquoise2"), labels = c("No", "Yes")) +
+  theme_classic()
+
+
+ggsave("29-Jan-23_Density plot of Alpha_AAA metabolite with_out log transformation.png", last_plot(), width = 10, height = 7, pointsize = 4, dpi = 300, units = "in")
+
+#---------#
 
 
