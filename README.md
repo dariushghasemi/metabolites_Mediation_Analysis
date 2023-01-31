@@ -1,6 +1,6 @@
-# metabolites_Mediation_Analysis
+# Metabolites Mediation Analysis
 
-- Metabolites transformed by natural logarithm.
+- Metabolites are already transformed by logarithm function.
 
 ### Medation analysis steps
 - Step 1 is already done by GWAS.
